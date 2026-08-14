@@ -101,7 +101,7 @@ async function handleChatCompletion(request: Request, env: WorkerEnv, ctx: Execu
   const mapping = await loadKeyMapping(customerKey, env);
 
   // Check expiration for time-based cards
-  if (mapping.expires_at && Date.now() > mapping.expires_at) {
+  if (mapping.expires_at && Date.now() >= mapping.expires_at) {
     throw new ApiError(
       'API key has expired.',
       401,
@@ -110,12 +110,23 @@ async function handleChatCompletion(request: Request, env: WorkerEnv, ctx: Execu
     );
   }
 
-  // Check quota for request-count-based cards
+  // Check quota for request-count-based cards (increment BEFORE upstream call to prevent race condition)
+  let needsQuotaCheck = false;
+  let usageName = '';
   if (mapping.max_requests !== undefined) {
-    const usageName = await secretFingerprint(customerKey);
-    const currentCount = await env.USAGE_COUNTERS.getByName(usageName).getCount();
+    needsQuotaCheck = true;
+    usageName = await secretFingerprint(customerKey);
+    const usageCounter = env.USAGE_COUNTERS.getByName(usageName);
     
-    if (currentCount >= mapping.max_requests) {
+    // Restore count from KV if needed (DO eviction recovery)
+    if (mapping.request_count !== undefined) {
+      await usageCounter.ensureAtLeast(mapping.request_count);
+    }
+    
+    // Increment FIRST, then check (atomic operation prevents race condition)
+    const newCount = await usageCounter.increment();
+    
+    if (newCount > mapping.max_requests) {
       throw new ApiError(
         `API key usage limit exceeded. Maximum ${mapping.max_requests} requests allowed.`,
         429,
@@ -144,14 +155,18 @@ async function handleChatCompletion(request: Request, env: WorkerEnv, ctx: Execu
   const messages = injectIdentity(body.messages, modelConfig.identity);
   const upstreamBody: JsonObject = { ...body, messages };
   const nvidiaKeys = orderedNvidiaKeys(mapping.nvidia_keys, customerKey);
-  const usageName = await secretFingerprint(customerKey);
-  const usageCounter = env.USAGE_COUNTERS.getByName(usageName);
-  ctx.waitUntil(
-    (async () => {
-      if (mapping.request_count !== undefined) await usageCounter.ensureAtLeast(mapping.request_count);
-      await usageCounter.increment();
-    })().catch(error => logError('usage_increment_failed', error, { customer: usageName })),
-  );
+  
+  // Increment usage counter for keys without quota limits (already incremented above for quota-limited keys)
+  if (!needsQuotaCheck) {
+    const usageName = await secretFingerprint(customerKey);
+    const usageCounter = env.USAGE_COUNTERS.getByName(usageName);
+    ctx.waitUntil(
+      (async () => {
+        if (mapping.request_count !== undefined) await usageCounter.ensureAtLeast(mapping.request_count);
+        await usageCounter.increment();
+      })().catch(error => logError('usage_increment_failed', error, { customer: usageName })),
+    );
+  }
 
   if (body.stream) {
     return streamWithFallback(
