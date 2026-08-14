@@ -100,6 +100,31 @@ async function handleChatCompletion(request: Request, env: WorkerEnv, ctx: Execu
   const customerKey = parseBearerToken(request.headers.get('Authorization'));
   const mapping = await loadKeyMapping(customerKey, env);
 
+  // Check expiration for time-based cards
+  if (mapping.expires_at && Date.now() > mapping.expires_at) {
+    throw new ApiError(
+      'API key has expired.',
+      401,
+      'authentication_error',
+      'expired_api_key',
+    );
+  }
+
+  // Check quota for request-count-based cards
+  if (mapping.max_requests !== undefined) {
+    const usageName = await secretFingerprint(customerKey);
+    const currentCount = await env.USAGE_COUNTERS.getByName(usageName).getCount();
+    
+    if (currentCount >= mapping.max_requests) {
+      throw new ApiError(
+        `API key usage limit exceeded. Maximum ${mapping.max_requests} requests allowed.`,
+        429,
+        'rate_limit_error',
+        'quota_exceeded',
+      );
+    }
+  }
+
   let rawBody: unknown;
   try {
     rawBody = await request.json();
@@ -235,16 +260,43 @@ async function handleAdminCreateKey(request: Request, env: WorkerEnv): Promise<R
     throw invalidRequest('note must be a string.', 'invalid_note', 'note');
   }
 
+  // Validate days parameter (1, 7, 15, 30)
+  if (body.days !== undefined) {
+    if (typeof body.days !== 'number' || ![1, 7, 15, 30].includes(body.days)) {
+      throw invalidRequest('days must be one of: 1, 7, 15, 30.', 'invalid_days', 'days');
+    }
+  }
+
+  // Validate max_requests parameter (2000, 5000)
+  if (body.max_requests !== undefined) {
+    if (typeof body.max_requests !== 'number' || ![2000, 5000].includes(body.max_requests)) {
+      throw invalidRequest('max_requests must be one of: 2000, 5000.', 'invalid_max_requests', 'max_requests');
+    }
+  }
+
   const customerKey = `sk-${randomHex(24)}`;
   const mapping: KeyMapping = {
     nvidia_keys: nvidiaKeys.map(key => String(key).trim()),
     created_at: new Date().toISOString(),
     note: body.note?.slice(0, 500) ?? '',
   };
+
+  // Set expiration for time-based cards
+  if (typeof body.days === 'number') {
+    mapping.expires_at = Date.now() + body.days * 86400000; // days to milliseconds
+  }
+
+  // Set quota for request-count-based cards
+  if (typeof body.max_requests === 'number') {
+    mapping.max_requests = body.max_requests;
+  }
+
   await env.KEY_MAPPINGS.put(customerKey, JSON.stringify(mapping));
   return jsonResponse({
     customer_key: customerKey,
     created_at: mapping.created_at,
+    expires_at: mapping.expires_at ? new Date(mapping.expires_at).toISOString() : null,
+    max_requests: mapping.max_requests ?? null,
     note: mapping.note,
     nvidia_keys: mapping.nvidia_keys.map(maskSecret),
   }, 201);
@@ -322,6 +374,12 @@ function parseKeyMapping(mappingJson: string): KeyMapping {
     note: typeof parsed.note === 'string' ? parsed.note : '',
     request_count: typeof parsed.request_count === 'number' && Number.isFinite(parsed.request_count)
       ? Math.max(0, Math.floor(parsed.request_count))
+      : undefined,
+    expires_at: typeof parsed.expires_at === 'number' && Number.isFinite(parsed.expires_at)
+      ? Math.floor(parsed.expires_at)
+      : undefined,
+    max_requests: typeof parsed.max_requests === 'number' && Number.isFinite(parsed.max_requests)
+      ? Math.max(0, Math.floor(parsed.max_requests))
       : undefined,
   };
 }

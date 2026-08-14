@@ -5,6 +5,8 @@ export interface KeyMapping {
   created_at: string;
   note?: string;
   request_count?: number;
+  expires_at?: number;      // Unix timestamp (ms) - expiration time for time-based cards
+  max_requests?: number;    // Maximum request count limit for quota-based cards
 }
 
 export interface ModelConfig {
