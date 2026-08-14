@@ -1,0 +1,4 @@
+name = "ip-test-a"
+main = "test-ip-worker-a.js"
+compatibility_date = "2024-01-01"
+account_id = "73920d17c04ed970281acfa38397f338"
